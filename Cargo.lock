@@ -1796,6 +1796,7 @@ dependencies = [
  "hyper-util",
  "tokio",
  "tokio-task-pool",
+ "tokio-util",
  "tor-rtcompat",
  "tracing",
  "tracing-subscriber",

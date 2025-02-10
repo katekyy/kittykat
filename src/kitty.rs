@@ -1,24 +1,40 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-use arti_client::TorClient;
+use arti_client::{DataStream, TorClient};
 use bytes::Bytes;
-use http::{HeaderValue, Request, Response, StatusCode};
-use http_body_util::{BodyExt, Full, combinators::BoxBody};
+use http::{HeaderValue, Method, Request, Response, StatusCode};
+use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
 use hyper::{
     body::Incoming,
     rt::{Read, Write},
     server::conn::http1,
     service::service_fn,
+    upgrade::Upgraded,
 };
 use hyper_util::rt::TokioIo;
-use tokio::sync::Mutex;
-use tor_rtcompat::PreferredRuntime;
-use tracing::{debug, info, trace, warn};
-use uuid::Uuid;
+use token::Token;
+use tokio::{
+    io::{self, AsyncWriteExt},
+    sync::Mutex,
+};
+use tokio_task_pool::Task;
+use tokio_util::compat::FuturesAsyncReadCompatExt;
+use tor_rtcompat::tokio::PreferredRuntime;
+use tracing::{debug, error, info, trace, warn};
 
-const DEFAULT_UUID: Uuid = Uuid::nil();
+mod token;
 
-type ClientPool = HashMap<Uuid, TorClient<PreferredRuntime>>;
+type CircuitPool = HashMap<Token, Circuit>;
+
+#[derive(Clone)]
+struct Circuit {
+    client: TorClient<PreferredRuntime>,
+    last_used: Instant,
+}
 
 #[derive(Clone, Debug)]
 pub struct Preferences {
@@ -28,29 +44,44 @@ pub struct Preferences {
 
 #[derive(Clone)]
 pub struct KittyKat {
-    client_pool: Arc<Mutex<ClientPool>>,
+    client_pool: Arc<Mutex<CircuitPool>>,
+    base_client: Arc<TorClient<PreferredRuntime>>,
     task_pool: Arc<tokio_task_pool::Pool>,
     preferences: Preferences,
 }
 
 impl KittyKat {
-    pub fn new(base_client: TorClient<PreferredRuntime>, prefs: Preferences) -> Self {
+    pub async fn new(base_client: TorClient<PreferredRuntime>, prefs: Preferences) -> Self {
         info!("Creating a KittyKat instance with preferences: {prefs:?}");
 
-        let mut map = HashMap::new();
-        map.insert(DEFAULT_UUID, base_client);
-
         let task_pool = if let Some(bound) = prefs.pool_bound {
-            tokio_task_pool::Pool::bounded(bound * 2)
+            tokio_task_pool::Pool::bounded(bound + 1)
         } else {
             tokio_task_pool::Pool::unbounded()
         };
 
-        Self {
-            client_pool: Arc::new(Mutex::new(map)),
-            task_pool: Arc::new(task_pool),
+        let task_pool = Arc::new(task_pool);
+
+        let s = Self {
+            client_pool: Arc::new(Mutex::new(HashMap::new())),
+            base_client: Arc::new(base_client),
+            task_pool: Arc::clone(&task_pool),
             preferences: prefs,
-        }
+        };
+
+        let s_clone = s.clone();
+        task_pool
+            .spawn_task(
+                Task::new(async move {
+                    let s = s_clone.clone();
+                    s.cleanup_stale_circuits().await;
+                })
+                .with_id("cleanup"),
+            )
+            .await
+            .unwrap();
+
+        s
     }
 
     pub async fn serve_connection<I>(&self, io: I)
@@ -58,10 +89,14 @@ impl KittyKat {
         I: Read + Write + Unpin + Send + 'static,
     {
         let self_clone = self.clone();
-        let service = service_fn(move |req| Self::handle_request(self_clone.clone(), req));
+        let service = service_fn(move |req| Self::proxy(self_clone.clone(), req));
         self.task_pool
             .spawn(async move {
-                match http1::Builder::new().serve_connection(io, service).await {
+                match http1::Builder::new()
+                    .serve_connection(io, service)
+                    .with_upgrades()
+                    .await
+                {
                     Ok(()) => {}
                     Err(err) => eprintln!("Got an error while serving a connection: {}", err),
                 }
@@ -70,100 +105,162 @@ impl KittyKat {
             .unwrap();
     }
 
-    async fn fork_client(&self) -> (Uuid, TorClient<PreferredRuntime>) {
-        let new_id = Uuid::new_v4();
-
-        let client_pool = Arc::clone(&self.client_pool);
-        let prefs = self.preferences.clone();
-
-        debug!(
-            "Forking a new Tor client {}, purge after {:#?}",
-            new_id, prefs.client_lifetime
-        );
-
-        self.task_pool
-            .spawn(async move {
-                tokio::time::sleep(prefs.client_lifetime).await;
-                debug!("Purging client {} from the pool", new_id);
-                client_pool.lock().await.remove(&new_id);
-            })
-            .await
-            .unwrap();
-
-        let mut client_pool = self.client_pool.lock().await;
-
-        let new_client = client_pool.get(&DEFAULT_UUID).unwrap().isolated_client();
-        client_pool.insert(new_id, new_client.clone());
-
-        (new_id, new_client)
-    }
-
-    async fn get_or_fork_client(&self, id: &str) -> Option<(Uuid, TorClient<PreferredRuntime>)> {
-        if id.is_empty() {
-            Some(self.fork_client().await)
-        } else {
-            match Uuid::parse_str(id) {
-                Ok(id) => {
-                    let maybe_client = {
-                        let client_pool_g = self.client_pool.lock().await;
-                        client_pool_g.get(&id).cloned()
-                    };
-                    if let Some(client) = maybe_client {
-                        Some((id, client))
-                    } else {
-                        Some(self.fork_client().await)
-                    }
-                }
-                Err(_) => None,
-            }
-        }
-    }
-
-    async fn handle_request(
+    async fn proxy(
         self,
         req: Request<Incoming>,
     ) -> Result<Response<BoxBody<hyper::body::Bytes, hyper::Error>>, hyper::Error> {
-        trace!("Got a new request: {:?}", &req);
+        trace!("Handling a new request: {:#?}", &req);
 
-        // Validate whether the URI is absolute
-        let uri = req.uri().clone();
-        if let None = uri.host() {
-            debug!(
-                "Proxying failed for URI: {:?} - Absolute URI required",
-                &uri
-            );
-            return Ok(Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(full("Absolute URI required"))
-                .unwrap());
+        if req.method() == Method::CONNECT {
+            self.handle_tunnel(req).await
+        } else {
+            self.handle_unsafe_request(req).await
         }
+    }
 
-        // Get or fork a Tor client from the pool
-        let (id, client) = match self
-            .get_or_fork_client(
-                req.headers()
-                    .get("x-kitty")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or(""),
-            )
-            .await
-        {
-            Some(pair) => pair,
+    async fn cleanup_stale_circuits(&self) {
+        let mut interval = tokio::time::interval(self.preferences.client_lifetime);
+        loop {
+            interval.tick().await;
+            let mut pool = self.client_pool.lock().await;
+            pool.retain(|t, circuit| {
+                let retain = circuit.last_used.elapsed() < self.preferences.client_lifetime;
+                if !retain {
+                    debug!("Purging Tor circuit {:?}", t);
+                }
+                retain
+            });
+        }
+    }
+
+    async fn get_or_make_circuit(
+        &self,
+        maybe_token: Option<String>,
+    ) -> Option<TorClient<PreferredRuntime>> {
+        let mut pool = self.client_pool.lock().await;
+
+        let token = match maybe_token {
+            Some(token) => {
+                let token = Token::session(token);
+
+                // Create a new circuit if the last one got cleaned up or it never existed in the first place.
+                if let Some(circuit) = pool.get_mut(&token) {
+                    circuit.last_used = Instant::now();
+                    return Some(circuit.client.clone());
+                }
+
+                token
+            }
+            None => Token::anonymous(),
+        };
+
+        let client = self.base_client.isolated_client();
+        pool.insert(token, Circuit {
+            client: client.clone(),
+            last_used: Instant::now(),
+        });
+        Some(client)
+    }
+
+    fn extract_token(req: &Request<Incoming>) -> Option<String> {
+        // The authorization scheme (Basic, Bearer, etc.) doesn't really stop us from using the entire string here.
+        // ~ some silly snep
+        let token = req
+            .headers()
+            .get("proxy-authorization")
+            .and_then(|v| v.to_str().map(|s| String::from(s)).ok());
+        token
+    }
+
+    async fn handle_tunnel(
+        &self,
+        req: Request<Incoming>,
+    ) -> Result<Response<BoxBody<hyper::body::Bytes, hyper::Error>>, hyper::Error> {
+        let uri = req.uri().clone();
+        let (host, port) = (
+            uri.host().expect("absolute URI").to_string(),
+            uri.port_u16().unwrap_or(443),
+        );
+
+        let client = match self.get_or_make_circuit(Self::extract_token(&req)).await {
+            Some(client) => client,
             None => {
                 return Ok(Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .body(full("Invalid ID"))
+                    .status(StatusCode::UNAUTHORIZED)
+                    .body(full("Invalid token"))
                     .unwrap());
             }
         };
 
-        // Parse target details
+        tokio::spawn(async move {
+            match hyper::upgrade::on(req).await {
+                Ok(upgraded) => match client.connect((host, port)).await {
+                    Ok(tor_stream) => {
+                        if let Err(err) = Self::tunnel(upgraded, tor_stream).await {
+                            // I'm probably stawpid 'cause the tunnel doesn't close correctly...
+                            error!("Tunnel failed: {}", err);
+                        }
+                    }
+                    Err(err) => error!("Tor connection failed: {}", err),
+                },
+                Err(err) => error!("Upgrade failed: {}", err),
+            }
+        });
+
+        Ok(Response::new(empty()))
+    }
+
+    async fn tunnel(upgraded: Upgraded, tor_stream: DataStream) -> io::Result<()> {
+        let mut upgraded = TokioIo::new(upgraded);
+        let mut tor_stream = tor_stream.compat();
+
+        let (mut client_read, mut client_write) = tokio::io::split(&mut upgraded);
+        let (mut tor_read, mut tor_write) = tokio::io::split(&mut tor_stream);
+
+        // Make each direction shutdown on it's own.
+        let client_to_tor = async {
+            let bytes = tokio::io::copy(&mut client_read, &mut tor_write).await?;
+            tor_write.shutdown().await?;
+            Ok::<u64, io::Error>(bytes)
+        };
+
+        let tor_to_client = async {
+            let bytes = tokio::io::copy(&mut tor_read, &mut client_write).await?;
+            client_write.shutdown().await?;
+            Ok::<u64, io::Error>(bytes)
+        };
+
+        let (client_res, tor_res) = tokio::join!(client_to_tor, tor_to_client);
+
+        client_res?;
+        tor_res?;
+
+        Ok(())
+    }
+
+    async fn handle_unsafe_request(
+        &self,
+        req: Request<Incoming>,
+    ) -> Result<Response<BoxBody<hyper::body::Bytes, hyper::Error>>, hyper::Error> {
+        let uri = req.uri().clone();
         let (host, port) = (
-            uri.host().expect("Validated absolute URI"),
+            uri.host().expect("absolute URI"),
             uri.port_u16().unwrap_or(80),
         );
 
-        // Connect through Tor >w<
+        let client = match self.get_or_make_circuit(Self::extract_token(&req)).await {
+            Some(client) => client,
+            None => {
+                return Ok(Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .body(full("Invalid token"))
+                    .unwrap());
+            }
+        };
+
+        debug!("Attempting an unsafe connection to: {}", uri);
+
+        // Connect through Tor owo.
         let stream = match client.connect((host, port)).await {
             Ok(s) => TokioIo::new(s),
             Err(e) => {
@@ -175,7 +272,7 @@ impl KittyKat {
             }
         };
 
-        // Perform the HTTP handshake
+        // Perform a HTTP handshake.
         let (mut sender, conn) = hyper::client::conn::http1::handshake(stream).await?;
 
         tokio::spawn(async move {
@@ -184,7 +281,7 @@ impl KittyKat {
             }
         });
 
-        // Convert request for forwarding
+        // Convert request for forwarding.
         let (parts, body) = req.into_parts();
         let path = parts
             .uri
@@ -198,7 +295,6 @@ impl KittyKat {
             .version(parts.version);
 
         *outgoing_req.headers_mut().unwrap() = parts.headers.clone();
-        outgoing_req.headers_mut().unwrap().remove("x-kitty"); // Remove our header
         outgoing_req
             .headers_mut()
             .unwrap()
@@ -206,13 +302,12 @@ impl KittyKat {
 
         let outgoing_req = outgoing_req.body(body).unwrap();
 
-        // Forward request and relay response
+        // Forward request and relay response.
         let mut response = sender.send_request(outgoing_req).await?;
         let status = response.status();
         let version = response.version();
 
-        let mut headers = std::mem::take(response.headers_mut());
-        headers.insert("x-kitty", HeaderValue::from_str(&id.to_string()).unwrap());
+        let headers = std::mem::take(response.headers_mut());
 
         let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
 
@@ -230,6 +325,12 @@ impl KittyKat {
 
 fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
     Full::new(chunk.into())
+        .map_err(|never| match never {})
+        .boxed()
+}
+
+fn empty() -> BoxBody<Bytes, hyper::Error> {
+    Empty::<Bytes>::new()
         .map_err(|never| match never {})
         .boxed()
 }

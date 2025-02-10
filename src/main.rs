@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use arti_client::{TorClient, TorClientConfig};
+use arti_client::{StreamPrefs, TorClient, TorClientConfig};
 use hyper_util::rt::TokioIo;
 use kitty::{KittyKat, Preferences};
 use tokio::net::TcpListener;
@@ -21,15 +21,24 @@ async fn main() -> Result<(), anyhow::Error> {
     let listener = TcpListener::bind("127.0.0.1:8118").await?;
 
     let config = TorClientConfig::default();
-    let client = TorClient::builder()
-        .config(config)
-        .create_bootstrapped()
-        .await?;
+    let mut client =
+        TorClient::with_runtime(tor_rtcompat::tokio::PreferredRuntime::current().unwrap())
+            .config(config)
+            .create_bootstrapped()
+            .await?;
+
+    // Set stream prefs
+    {
+        let mut prefs = StreamPrefs::new();
+        prefs.optimistic(); // Make the stream optimistic
+        client.set_stream_prefs(prefs);
+    }
 
     let kitty = KittyKat::new(client, Preferences {
         client_lifetime: Duration::from_secs(10),
         pool_bound: None,
-    });
+    })
+    .await;
 
     loop {
         match listener.accept().await {

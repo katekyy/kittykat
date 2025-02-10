@@ -1,27 +1,50 @@
 # kittykat
 
 `kittykat` is an on-demand rotating HTTP proxy that routes traffic through the Tor network.
-It dynamically creates isolated Tor circuits for each client, ensuring better anonymity and reduced cross-request correlation.
+It dynamically creates isolated Tor circuits for each authorization token, ensuring better anonymity, reduced cross-request correlation
+and it can provide a good way to stop your scrapers from getting blocked or rate limited if you juggle the tokens right.
 
 ## Features
 
-  * __Rotating Tor Circuits__: Each client gets an independent Tor connection.
+  * __Tor Circuit Isolation__: For each authentication token in the `Proxy-Authorization` header happens a fork of the base Tor client by generating a new isolation token
+    (the isolation token is not being generated based on our authentication token, if you want to know more about that, see Arti's [TorClient](https://tpo.pages.torproject.net/core/doc/rust/arti_client/struct.TorClient.html)
+    and it's `isolated_client` method).
 
-  * __UUID-Based Session Management__: Send a `x-kitty` header with a valid UUIDv4 to reuse an existing circuit/session or leave it empty for a new one.
+  * __Anoynmous Circuit Isolation__: When the authorization header is not found, `kittykat` will generate a random UUIDv4 so you can use it even when your client
+    doesn't support proxy authorization (it is not highly recommended though).
 
-  * __Automatic Client Expiration__: Tor clients are purged after a set duration (default: 10 seconds).
+  * __Automatic Cleanup__: Idle circuits are purged after a configurable TTL (default: 10s).
+
+  * __Bidirectional Tunneling__: Full HTTPs/CONNECT support for secure traffic.
+
 
 ## Usage
 
-To use `kittykat`, send HTTP requests through the proxy. To persist a Tor circuit, include the `x-kitty` header with a valid UUID.
+### Basic Proxy Setup
 
-Example:
+Configure your client to use a HTTP proxy.
 
-```http
-GET http://example.com
-host: example.com
-x-kitty: 57a6aa49-3ae4-491c-a954-42cfb2014042
+```bash
+# Using curl.
+curl -x http://localhost:8118 https://check.torproject.org/api/ip
 ```
 
-If `x-kitty` is omitted or empty, a new Tor circuit is assigned and the response will contain a new `x-kitty` header.
-The same will occur when the UUID is valid but got purged or did not exist at all.
+As you can see we can use `kittykat` without authorization as it'll generate an anonymous token for us internally.
+
+### Session
+
+```bash
+# Using curl.
+
+curl -x http://user:token@localhost:8118 https://check.torproject.org/api/ip
+#=> { "isTor": true, "IP": "8.8.4.4" }
+
+curl -x http://user:token@localhost:8118 https://check.torproject.org/api/ip
+#=> { "isTor": true, "IP": "8.8.4.4" }
+```
+
+We got the same IP, yay! :3
+
+## Configuration
+
+_Work-in-progress_
