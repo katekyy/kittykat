@@ -1,6 +1,4 @@
-#![feature(local_waker, noop_waker)]
-
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use arti_client::{StreamPrefs, TorClient, TorClientConfig};
 use hyper_util::rt::TokioIo;
@@ -34,17 +32,23 @@ async fn main() -> Result<(), anyhow::Error> {
         client.set_stream_prefs(prefs);
     }
 
-    let kitty = KittyKat::new(client, Preferences {
-        client_lifetime: Duration::from_secs(10),
-        pool_bound: None,
-    })
+    let kitty = KittyKat::new(
+        client,
+        Preferences {
+            client_lifetime: Duration::from_secs(8),
+            pool_bound: Some(128),
+        },
+    )
     .await;
 
+    let kitty = Arc::new(kitty);
+
     loop {
+        let kitty = Arc::clone(&kitty);
         match listener.accept().await {
             Ok((stream, _addr)) => {
                 let io = TokioIo::new(stream);
-                kitty.serve_connection(io).await;
+                tokio::spawn(async move { kitty.serve_connection(io).await });
             }
             Err(err) => {
                 eprintln!("Got an error while accepting a connection: {}", err)
