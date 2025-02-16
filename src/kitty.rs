@@ -4,10 +4,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use arti_client::{DataStream, TorClient};
+use arti_client::{DataStream, IsolationToken, StreamPrefs, TorClient};
 use bytes::Bytes;
 use http::{HeaderValue, Method, Request, Response, StatusCode};
-use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
+use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
 use hyper::{
     body::Incoming,
     rt::{Read, Write},
@@ -17,41 +17,38 @@ use hyper::{
 };
 use hyper_util::rt::TokioIo;
 use token::Token;
-use tokio::{
-    io::{self, AsyncWriteExt},
-    sync::Mutex,
-};
+use tokio::{io, sync::Mutex};
 use tokio_task_pool::Task;
-use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tor_rtcompat::tokio::PreferredRuntime;
 use tracing::{debug, error, info, trace, warn};
 
 mod token;
 
-type CircuitPool = HashMap<Token, Circuit>;
+type IsolationPool = HashMap<Token, Isolation>;
 
-#[derive(Clone)]
-struct Circuit {
-    client: TorClient<PreferredRuntime>,
+#[derive(Clone, Copy)]
+struct Isolation {
+    isolation: IsolationToken,
     last_used: Instant,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Preferences {
     pub client_lifetime: Duration,
     pub pool_bound: Option<usize>,
+    pub stream_prefs: StreamPrefs,
 }
 
 #[derive(Clone)]
 pub struct KittyKat {
-    client_pool: Arc<Mutex<CircuitPool>>,
-    base_client: Arc<TorClient<PreferredRuntime>>,
+    isolation_pool: Arc<Mutex<IsolationPool>>,
+    client: Arc<TorClient<PreferredRuntime>>,
     task_pool: Arc<tokio_task_pool::Pool>,
     preferences: Preferences,
 }
 
 impl KittyKat {
-    pub async fn new(base_client: TorClient<PreferredRuntime>, prefs: Preferences) -> Self {
+    pub async fn new(client: TorClient<PreferredRuntime>, prefs: Preferences) -> Self {
         info!("Creating a KittyKat instance with preferences: {prefs:?}");
 
         let task_pool = if let Some(bound) = prefs.pool_bound {
@@ -63,8 +60,8 @@ impl KittyKat {
         let task_pool = Arc::new(task_pool);
 
         let s = Self {
-            client_pool: Arc::new(Mutex::new(HashMap::new())),
-            base_client: Arc::new(base_client),
+            isolation_pool: Arc::new(Mutex::new(HashMap::new())),
+            client: Arc::new(client),
             task_pool: Arc::clone(&task_pool),
             preferences: prefs,
         };
@@ -74,7 +71,7 @@ impl KittyKat {
             .spawn_task(
                 Task::new(async move {
                     let s = s_clone.clone();
-                    s.cleanup_stale_circuits().await;
+                    s.cleanup_stale_isolations().await;
                 })
                 .with_id("cleanup"),
             )
@@ -118,26 +115,23 @@ impl KittyKat {
         }
     }
 
-    async fn cleanup_stale_circuits(&self) {
+    async fn cleanup_stale_isolations(&self) {
         let mut interval = tokio::time::interval(self.preferences.client_lifetime);
         loop {
             interval.tick().await;
-            let mut pool = self.client_pool.lock().await;
+            let mut pool = self.isolation_pool.lock().await;
             pool.retain(|t, circuit| {
                 let retain = circuit.last_used.elapsed() < self.preferences.client_lifetime;
                 if !retain {
-                    debug!("Purging Tor circuit {:?}", t);
+                    debug!("Purging isolation {:?}", t);
                 }
                 retain
             });
         }
     }
 
-    async fn get_or_make_circuit(
-        &self,
-        maybe_token: Option<String>,
-    ) -> Option<TorClient<PreferredRuntime>> {
-        let mut pool = self.client_pool.lock().await;
+    async fn get_or_isolate(&self, maybe_token: Option<String>) -> Option<IsolationToken> {
+        let mut pool = self.isolation_pool.lock().await;
 
         let token = match maybe_token {
             Some(token) => {
@@ -146,7 +140,7 @@ impl KittyKat {
                 // Create a new circuit if the last one got cleaned up or it never existed in the first place.
                 if let Some(circuit) = pool.get_mut(&token) {
                     circuit.last_used = Instant::now();
-                    return Some(circuit.client.clone());
+                    return Some(circuit.isolation);
                 }
 
                 token
@@ -154,12 +148,15 @@ impl KittyKat {
             None => Token::anonymous(),
         };
 
-        let client = self.base_client.isolated_client();
-        pool.insert(token, Circuit {
-            client: client.clone(),
-            last_used: Instant::now(),
-        });
-        Some(client)
+        let isolation = IsolationToken::new();
+        pool.insert(
+            token,
+            Isolation {
+                isolation,
+                last_used: Instant::now(),
+            },
+        );
+        Some(isolation)
     }
 
     fn extract_token(req: &Request<Incoming>) -> Option<String> {
@@ -182,8 +179,8 @@ impl KittyKat {
             uri.port_u16().unwrap_or(443),
         );
 
-        let client = match self.get_or_make_circuit(Self::extract_token(&req)).await {
-            Some(client) => client,
+        let isolation = match self.get_or_isolate(Self::extract_token(&req)).await {
+            Some(isolation) => isolation,
             None => {
                 return Ok(Response::builder()
                     .status(StatusCode::UNAUTHORIZED)
@@ -192,17 +189,22 @@ impl KittyKat {
             }
         };
 
+        let client = Arc::clone(&self.client);
+        let mut stream_prefs = self.preferences.stream_prefs.clone();
         tokio::spawn(async move {
+            stream_prefs.set_isolation(isolation);
+
             match hyper::upgrade::on(req).await {
-                Ok(upgraded) => match client.connect((host, port)).await {
-                    Ok(tor_stream) => {
-                        if let Err(err) = Self::tunnel(upgraded, tor_stream).await {
-                            // I'm probably stawpid 'cause the tunnel doesn't close correctly...
-                            error!("Tunnel failed: {}", err);
+                Ok(upgraded) => {
+                    match client.connect_with_prefs((host, port), &stream_prefs).await {
+                        Ok(tor_stream) => {
+                            if let Err(err) = Self::tunnel(upgraded, tor_stream).await {
+                                error!("Tunnel failed: {}", err);
+                            }
                         }
+                        Err(err) => error!("Tor connection failed: {}", err),
                     }
-                    Err(err) => error!("Tor connection failed: {}", err),
-                },
+                }
                 Err(err) => error!("Upgrade failed: {}", err),
             }
         });
@@ -210,30 +212,32 @@ impl KittyKat {
         Ok(Response::new(empty()))
     }
 
-    async fn tunnel(upgraded: Upgraded, tor_stream: DataStream) -> io::Result<()> {
-        let mut upgraded = TokioIo::new(upgraded);
-        let mut tor_stream = tor_stream.compat();
+    async fn tunnel(upgraded: Upgraded, mut tor_stream: DataStream) -> io::Result<()> {
+        let mut client_stream = TokioIo::new(upgraded);
 
-        let (mut client_read, mut client_write) = tokio::io::split(&mut upgraded);
-        let (mut tor_read, mut tor_write) = tokio::io::split(&mut tor_stream);
+        let (_client_count, _target_count) =
+            tokio::io::copy_bidirectional(&mut client_stream, &mut tor_stream).await?;
 
-        // Make each direction shutdown on it's own.
-        let client_to_tor = async {
-            let bytes = tokio::io::copy(&mut client_read, &mut tor_write).await?;
-            tor_write.shutdown().await?;
-            Ok::<u64, io::Error>(bytes)
-        };
+        // let (mut client_read, mut client_write) = tokio::io::split(&mut client_stream);
+        // let (mut target_read, mut target_write) = tokio::io::split(&mut tor_stream);
 
-        let tor_to_client = async {
-            let bytes = tokio::io::copy(&mut tor_read, &mut client_write).await?;
-            client_write.shutdown().await?;
-            Ok::<u64, io::Error>(bytes)
-        };
+        // // Make each direction shutdown on it's own.
+        // let client_to_tor = async {
+        //     let bytes = tokio::io::copy(&mut client_read, &mut target_write).await?;
+        //     target_write.shutdown().await?;
+        //     Ok::<u64, io::Error>(bytes)
+        // };
 
-        let (client_res, tor_res) = tokio::join!(client_to_tor, tor_to_client);
+        // let tor_to_client = async {
+        //     let bytes = tokio::io::copy(&mut target_read, &mut client_write).await?;
+        //     client_write.shutdown().await?;
+        //     Ok::<u64, io::Error>(bytes)
+        // };
 
-        client_res?;
-        tor_res?;
+        // let (client_res, tor_res) = tokio::join!(client_to_tor, tor_to_client);
+
+        // client_res?;
+        // tor_res?;
 
         Ok(())
     }
@@ -248,8 +252,8 @@ impl KittyKat {
             uri.port_u16().unwrap_or(80),
         );
 
-        let client = match self.get_or_make_circuit(Self::extract_token(&req)).await {
-            Some(client) => client,
+        let isolation = match self.get_or_isolate(Self::extract_token(&req)).await {
+            Some(isolation) => isolation,
             None => {
                 return Ok(Response::builder()
                     .status(StatusCode::UNAUTHORIZED)
@@ -261,13 +265,20 @@ impl KittyKat {
         debug!("Attempting an unsafe connection to: {}", uri);
 
         // Connect through Tor owo.
-        let stream = match client.connect((host, port)).await {
+        let mut stream_prefs = self.preferences.stream_prefs.clone();
+        stream_prefs.set_isolation(isolation);
+
+        let stream = match self
+            .client
+            .connect_with_prefs((host, port), &stream_prefs)
+            .await
+        {
             Ok(s) => TokioIo::new(s),
-            Err(e) => {
-                warn!("Tor connection failed: {}", e);
+            Err(err) => {
+                warn!("Tor connection failed: {}", err);
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_GATEWAY)
-                    .body(full(format!("Tor connection failed: {}", e)))
+                    .body(full(format!("Tor connection failed: {}", err)))
                     .unwrap());
             }
         };
@@ -276,8 +287,8 @@ impl KittyKat {
         let (mut sender, conn) = hyper::client::conn::http1::handshake(stream).await?;
 
         tokio::spawn(async move {
-            if let Err(e) = conn.await {
-                eprintln!("Connection error: {}", e);
+            if let Err(err) = conn.await {
+                eprintln!("Connection error: {}", err);
             }
         });
 

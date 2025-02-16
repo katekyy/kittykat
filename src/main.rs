@@ -19,24 +19,21 @@ async fn main() -> Result<(), anyhow::Error> {
     let listener = TcpListener::bind("127.0.0.1:8118").await?;
 
     let config = TorClientConfig::default();
-    let mut client =
-        TorClient::with_runtime(tor_rtcompat::tokio::PreferredRuntime::current().unwrap())
-            .config(config)
-            .create_bootstrapped()
-            .await?;
+    let client = TorClient::with_runtime(tor_rtcompat::tokio::PreferredRuntime::current().unwrap())
+        .config(config)
+        .create_bootstrapped()
+        .await?;
 
-    // Set stream prefs
-    {
-        let mut prefs = StreamPrefs::new();
-        prefs.optimistic(); // Make the stream optimistic
-        client.set_stream_prefs(prefs);
-    }
+    let mut prefs = StreamPrefs::new();
+    prefs.optimistic(); // Make the stream optimistic
 
     let kitty = KittyKat::new(
         client,
         Preferences {
             client_lifetime: Duration::from_secs(8),
-            pool_bound: Some(128),
+            pool_bound: None,
+            stream_prefs: prefs,
+            ..Default::default()
         },
     )
     .await;

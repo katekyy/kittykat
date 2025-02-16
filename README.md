@@ -6,16 +6,14 @@ and it can provide a good way to stop your scrapers from getting blocked or rate
 
 ## Features
 
-  * __Tor Circuit Isolation__: For each authentication token in the `Proxy-Authorization` header happens a fork of the base Tor client by generating a new isolation token
-    (the isolation token is not being generated based on our authentication token, if you want to know more about that, see Arti's [TorClient](https://tpo.pages.torproject.net/core/doc/rust/arti_client/struct.TorClient.html)
-    and it's `isolated_client` method).
+  * __Tor Circuit Isolation__: For each authentication token in the `Proxy-Authorization` header we generate a new isolation token which ensures that connection
+    will use a different circuit (if you want to know more about that, see Arti's [TorClient](https://tpo.pages.torproject.net/core/doc/rust/arti_client/struct.TorClient.html)).
 
-  * __Anoynmous Circuit Isolation__: When the authorization header is not found, `kittykat` will generate a random UUIDv4 so you can use it even when your client
-    doesn't support proxy authorization (it is not highly recommended though).
+  * __Anoynmous Circuit Isolation__: When the authorization header is not found, `kittykat` will generate a temporary isolation token so you can use it even when your client doesn't support proxy authorization (it is highly unrecommended though).
 
   * __Automatic Cleanup__: Idle circuits are purged after a configurable TTL (default: 10s).
 
-  * __Bidirectional Tunneling__: Full HTTPs/CONNECT support for secure traffic.
+  * __Bidirectional Tunneling__: HTTPs/CONNECT support for secure traffic.
 
 
 ## Usage
