@@ -24,24 +24,24 @@ use tracing::{debug, error, info, trace, warn};
 
 mod token;
 
-type IsolationPool = HashMap<Token, Isolation>;
+type SessionPool = HashMap<Token, Session>;
 
 #[derive(Clone, Copy)]
-struct Isolation {
+struct Session {
     isolation: IsolationToken,
     last_used: Instant,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct Preferences {
-    pub client_lifetime: Duration,
+    pub token_lifetime: Duration,
     pub pool_bound: Option<usize>,
     pub stream_prefs: StreamPrefs,
 }
 
 #[derive(Clone)]
 pub struct KittyKat {
-    isolation_pool: Arc<Mutex<IsolationPool>>,
+    sessions: Arc<Mutex<SessionPool>>,
     client: Arc<TorClient<PreferredRuntime>>,
     task_pool: Arc<tokio_task_pool::Pool>,
     preferences: Preferences,
@@ -60,7 +60,7 @@ impl KittyKat {
         let task_pool = Arc::new(task_pool);
 
         let s = Self {
-            isolation_pool: Arc::new(Mutex::new(HashMap::new())),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
             client: Arc::new(client),
             task_pool: Arc::clone(&task_pool),
             preferences: prefs,
@@ -116,47 +116,54 @@ impl KittyKat {
     }
 
     async fn cleanup_stale_isolations(&self) {
-        let mut interval = tokio::time::interval(self.preferences.client_lifetime);
+        let lifetime = self.preferences.token_lifetime;
+        let mut interval = tokio::time::interval(lifetime);
         loop {
             interval.tick().await;
-            let mut pool = self.isolation_pool.lock().await;
-            pool.retain(|t, circuit| {
-                let retain = circuit.last_used.elapsed() < self.preferences.client_lifetime;
+            let mut sessions = self.sessions.lock().await;
+            sessions.retain(|t, circuit| {
+                let retain = circuit.last_used.elapsed() < lifetime;
                 if !retain {
-                    debug!("Purging isolation {:?}", t);
+                    debug!("Purging isolation {:?}, after {:?}", t, lifetime);
                 }
                 retain
             });
         }
     }
 
-    async fn get_or_isolate(&self, maybe_token: Option<String>) -> Option<IsolationToken> {
-        let mut pool = self.isolation_pool.lock().await;
+    async fn get_or_isolate(&self, maybe_token: Option<String>) -> IsolationToken {
+        let mut sessions = self.sessions.lock().await;
 
         let token = match maybe_token {
             Some(token) => {
                 let token = Token::session(token);
 
                 // Create a new circuit if the last one got cleaned up or it never existed in the first place.
-                if let Some(circuit) = pool.get_mut(&token) {
-                    circuit.last_used = Instant::now();
-                    return Some(circuit.isolation);
+                if let Some(s) = sessions.get_mut(&token) {
+                    s.last_used = Instant::now();
+                    return s.isolation;
                 }
 
                 token
             }
-            None => Token::anonymous(),
+            None => match sessions.iter_mut().find(|(k, _v)| k.is_anonymous()) {
+                Some((_, s)) => {
+                    s.last_used = Instant::now();
+                    return s.isolation;
+                }
+                None => Token::anonymous(),
+            },
         };
 
         let isolation = IsolationToken::new();
-        pool.insert(
+        sessions.insert(
             token,
-            Isolation {
+            Session {
                 isolation,
                 last_used: Instant::now(),
             },
         );
-        Some(isolation)
+        isolation
     }
 
     fn extract_token(req: &Request<Incoming>) -> Option<String> {
@@ -179,15 +186,9 @@ impl KittyKat {
             uri.port_u16().unwrap_or(443),
         );
 
-        let isolation = match self.get_or_isolate(Self::extract_token(&req)).await {
-            Some(isolation) => isolation,
-            None => {
-                return Ok(Response::builder()
-                    .status(StatusCode::UNAUTHORIZED)
-                    .body(full("Invalid token"))
-                    .unwrap());
-            }
-        };
+        let isolation = self.get_or_isolate(Self::extract_token(&req)).await;
+
+        trace!("Attempting to create a tunnel to: {}", uri);
 
         let client = Arc::clone(&self.client);
         let mut stream_prefs = self.preferences.stream_prefs.clone();
@@ -252,17 +253,9 @@ impl KittyKat {
             uri.port_u16().unwrap_or(80),
         );
 
-        let isolation = match self.get_or_isolate(Self::extract_token(&req)).await {
-            Some(isolation) => isolation,
-            None => {
-                return Ok(Response::builder()
-                    .status(StatusCode::UNAUTHORIZED)
-                    .body(full("Invalid token"))
-                    .unwrap());
-            }
-        };
+        let isolation = self.get_or_isolate(Self::extract_token(&req)).await;
 
-        debug!("Attempting an unsafe connection to: {}", uri);
+        trace!("Attempting an unsafe connection to: {}", uri);
 
         // Connect through Tor owo.
         let mut stream_prefs = self.preferences.stream_prefs.clone();
@@ -278,7 +271,7 @@ impl KittyKat {
                 warn!("Tor connection failed: {}", err);
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_GATEWAY)
-                    .body(full(format!("Tor connection failed: {}", err)))
+                    .body(full(format!("Tor connection failed: {}\n", err)))
                     .unwrap());
             }
         };

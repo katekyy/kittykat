@@ -1,4 +1,4 @@
-use std::{convert::Infallible, str::FromStr};
+use std::str::FromStr;
 
 use uuid::Uuid;
 
@@ -19,10 +19,14 @@ impl Token {
     pub(super) fn anonymous() -> Self {
         Self::Anonymous(Uuid::new_v4())
     }
+
+    pub(super) fn is_anonymous(&self) -> bool {
+        matches!(self, Self::Anonymous(_))
+    }
 }
 
 impl FromStr for Token {
-    type Err = Infallible;
+    type Err = core::convert::Infallible;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(Self::session(s))
     }
