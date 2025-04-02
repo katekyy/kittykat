@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 pub const CONFIG_FILE: &'static str = "kittykat.toml";
 
 const LISTEN_ADDRESS: &'static str = "KITTYKAT_LISTEN_ADDRESS";
-const TOKEN_LIFETIME: &'static str = "KITTYKAT_TOKEN_LIFETIME";
+const SESSION_LIFETIME: &'static str = "KITTYKAT_SESSION_LIFETIME";
+const ADDRESS_TIMEOUT: &'static str = "KITTYKAT_ADDRESS_TIMEOUT";
 const OPTIMISTIC_STREAM: &'static str = "KITTYKAT_OPTIMISTIC";
 const LOG_LEVEL: &'static str = "KITTYKAT_LOG";
 const MAX_CIRCUIT_DIRTINESS: &'static str = "KITTYKAT_MAX_CIRC_DIRT";
@@ -57,12 +58,19 @@ macro_rules! get_var {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub listen_address: SocketAddrV4,
-    #[serde(default = "default_token_lifetime")]
-    token_lifetime: u64,
+
+    #[serde(default = "default_session_lifetime")]
+    session_lifetime: u64,
+
+    #[serde(default = "default_address_timeout")]
+    address_timeout: u64,
+
     #[serde(default)]
     pub optimistic_stream: bool,
+
     #[serde(default)]
     log_level: Level,
+
     #[serde(default = "default_circuit_dirtiness")]
     max_circuit_dirtiness: u64,
 }
@@ -75,22 +83,24 @@ impl Config {
     pub fn from_env(vars: &HashMap<String, String>) -> Result<Self, Error> {
         let listen_address =
             get_var!(vars, LISTEN_ADDRESS else #r#"listen address "{}" could not be parsed"#)?;
-        let token_lifetime = get_var!(vars, TOKEN_LIFETIME else #r#"token lifetime "{}" could not be parsed as an integer"# default default_token_lifetime())?;
+        let session_lifetime = get_var!(vars, SESSION_LIFETIME else #r#"session lifetime "{}" could not be parsed as an integer"# default default_session_lifetime())?;
+        let address_timeout = get_var!(vars, ADDRESS_TIMEOUT else #r#"address lifetime "{}" could not be parsed as an integer"# default default_address_timeout())?;
         let optimistic_stream = get_var!(vars, OPTIMISTIC_STREAM else #r#"value "{}" for optimistic stream could not be parsed as a boolean"# default)?;
         let log_level = get_var!(vars, LOG_LEVEL else #r#"expected the log level to be one of: [trace, debug, info, warn, error], but got "{}" instead"# default)?;
         let max_circuit_dirtiness = get_var!(vars, MAX_CIRCUIT_DIRTINESS else #r#"max circuit dirtiness "{}" could not be parsed as an integer"# default default_circuit_dirtiness())?;
 
         Ok(Self {
             listen_address,
-            token_lifetime,
+            session_lifetime,
+            address_timeout,
             optimistic_stream,
             log_level,
             max_circuit_dirtiness,
         })
     }
 
-    pub fn token_lifetime(&self) -> Duration {
-        Duration::from_millis(self.token_lifetime)
+    pub fn session_lifetime(&self) -> Duration {
+        Duration::from_millis(self.session_lifetime)
     }
 
     pub fn log_level(&self) -> tracing::Level {
@@ -107,16 +117,20 @@ impl Config {
     }
 
     pub fn max_circuit_dirtiness(&self) -> Duration {
-        Duration::from_secs(self.max_circuit_dirtiness)
+        Duration::from_millis(self.max_circuit_dirtiness)
     }
 }
 
-fn default_token_lifetime() -> u64 {
+fn default_session_lifetime() -> u64 {
     10_000
 }
 
+fn default_address_timeout() -> u64 {
+    default_session_lifetime() * 2
+}
+
 fn default_circuit_dirtiness() -> u64 {
-    15
+    15_000
 }
 
 #[derive(Debug, Clone)]

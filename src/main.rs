@@ -1,4 +1,4 @@
-use std::{collections::HashMap, env, sync::Arc};
+use std::{collections::HashMap, env, sync::Arc, time::Duration};
 
 use anyhow::anyhow;
 use arti_client::{StreamPrefs, TorClient, TorClientConfig};
@@ -6,7 +6,7 @@ use config::{Config, CONFIG_FILE};
 use hyper_util::rt::TokioIo;
 use kitty::{KittyKat, Preferences};
 use tokio::{fs::File, io::AsyncReadExt, net::TcpListener};
-use tracing::info;
+use tracing::{debug, info};
 
 mod config;
 mod kitty;
@@ -48,6 +48,8 @@ async fn main() -> Result<(), anyhow::Error> {
         .finish();
     tracing::subscriber::set_global_default(subscriber).expect("Setting default subscriber failed");
 
+    debug!("Acquired config: {:?}", config);
+
     info!("Starting a listener on {}", config.listen_address);
 
     let listener = TcpListener::bind(config.listen_address).await?;
@@ -56,7 +58,17 @@ async fn main() -> Result<(), anyhow::Error> {
 
     client_config
         .circuit_timing()
-        .max_dirtiness(config.max_circuit_dirtiness());
+        .max_dirtiness(config.max_circuit_dirtiness())
+        .request_timeout(Duration::from_millis(
+            1000, // env::var("K_REQUEST_TIMEOUT").unwrap().parse().unwrap(),
+        ))
+        .request_loyalty(Duration::from_millis(
+            1000, // env::var("K_REQUEST_LOYALTY").unwrap().parse().unwrap(),
+        ));
+
+    client_config
+        .preemptive_circuits()
+        .min_exit_circs_for_port(10);
 
     let client_config = client_config.build()?;
 
@@ -65,22 +77,21 @@ async fn main() -> Result<(), anyhow::Error> {
         .create_bootstrapped()
         .await?;
 
-    let mut prefs = StreamPrefs::new();
+    let mut stream_prefs = StreamPrefs::new();
 
     if config.optimistic_stream {
-        prefs.optimistic();
+        stream_prefs.optimistic();
     }
 
-    let kitty = KittyKat::new(
-        client,
-        Preferences {
-            token_lifetime: config.token_lifetime(),
-            pool_bound: None, // TODO: acknowledge in configuration
-            stream_prefs: prefs,
-            ..Default::default()
-        },
-    )
-    .await;
+    let prefs = Preferences {
+        session_lifetime: config.session_lifetime(),
+        stream: stream_prefs,
+        ..Default::default()
+    };
+
+    let mut kitty = KittyKat::new(client, prefs, None);
+
+    kitty.start().await;
 
     let kitty = Arc::new(kitty);
 
